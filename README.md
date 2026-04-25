@@ -1,371 +1,100 @@
-# Rate Limiting Algorithms - Learning Notes
+# System Design: Scalable Notification System
 
-This document provides educational notes on the five rate limiting algorithms implemented in this project.
+## 1. Introduction
+A scalable notification system is a critical component of modern applications, responsible for delivering millions (or billions) of messages across multiple channels—such as push notifications, SMS, and email—in real time. The system must be highly available, fault-tolerant, and capable of handling sudden spikes in traffic without degrading performance.
 
----
-
-## Table of Contents
-
-1. [Token Bucket](#1-token-bucket)
-2. [Leaky Bucket](#2-leaky-bucket)
-3. [Fixed Window Counter](#3-fixed-window-counter)
-4. [Sliding Window Log](#4-sliding-window-log)
-5. [Sliding Window Counter](#5-sliding-window-counter)
-6. [Comparison Summary](#6-comparison-summary)
+This document outlines the architecture, data models, core components, and best practices required to build an enterprise-grade notification system.
 
 ---
 
-## 1. Token Bucket
+## 2. Requirements
 
-### Concept
+### 2.1 Functional Requirements
+* **Multi-Channel Support:** The system must send notifications via Push (iOS/Android), SMS, and Email.
+* **Template Management:** Support for dynamic message templates (e.g., "Hello {name}, your order {order_id} is shipped").
+* **User Preferences:** Users should be able to opt-in or opt-out of specific notification types and channels.
+* **Prioritization:** Notifications should have priority levels (e.g., OTPs are high priority; promotional emails are low priority).
+* **Scheduling:** Ability to schedule notifications for a future date/time.
 
-The Token Bucket algorithm uses a metaphor of a bucket that holds tokens:
-
-- **Bucket capacity**: Maximum number of tokens (max_tokens)
-- **Refill rate**: Tokens added per second (refill_rate)
-- **Request handling**: Each request consumes one token
-
-```
-        Tokens added at refill_rate
-              ↓
-    ┌─────────────────┐
-    │    BUCKET       │  Capacity: max_tokens
-    │   [●●●○○]       │  Current: 3 tokens
-    └─────────────────┘
-              ↓
-        Request takes 1 token
-```
-
-**How it works:**
-1. Tokens accumulate in the bucket at the refill rate
-2. Bucket cannot exceed max_tokens (excess tokens are discarded)
-3. When a request arrives:
-   - If tokens ≥ 1: consume one token, allow request
-   - If tokens < 1: reject request
-
-### Advantages
-
-| Advantage | Explanation |
-|-----------|-------------|
-| **Burst allowance** | Can handle sudden spikes up to max_tokens |
-| **Flexible** | Allows idle periods to build up tokens |
-| **Simple** | Easy to understand and implement |
-| **Smooth limiting** | Provides consistent rate over time |
-
-### Disadvantages
-
-| Disadvantage | Explanation |
-|--------------|-------------|
-| **Burst risk** | Large bursts may overwhelm downstream systems |
-| **State tracking** | Must track token count and last refill time |
-| **Not strict** | Less predictable than Leaky Bucket |
-
-### Real-World Use Cases
-
-- **API Rate Limiting**: GitHub API, Twitter API allow burst usage
-- **Cloud Services**: AWS rate limits with burst capacity
-- **Gaming**: Ability cooldowns with stored charges
-- **Network Traffic**: Traffic shaping with burst tolerance
+### 2.2 Non-Functional Requirements
+* **High Availability (HA):** The system must survive node or data center failures.
+* **High Throughput & Low Latency:** Capable of processing thousands of requests per second with minimal delay for transactional messages.
+* **Reliability:** At-least-once delivery guarantee. Notifications must not be lost.
+* **Scalability:** Horizontal scaling to handle traffic bursts (e.g., breaking news, Black Friday sales).
+* **Rate Limiting:** Prevent overwhelming the user (spam protection) and downstream third-party providers.
 
 ---
 
-## 2. Leaky Bucket
+## 3. High-Level Architecture
 
-### Concept
+The architecture follows a distributed, asynchronous, and event-driven model.
 
-The Leaky Bucket algorithm uses a metaphor of a bucket with a hole:
-
-- **Bucket capacity**: Maximum queue size
-- **Leak rate**: Requests processed per second
-- **Request handling**: Requests queue up and drain at constant rate
-
-```
-    Requests in (variable rate)
-          ↓
-    ┌─────────────┐
-    │   BUCKET    │  Queue: [req1, req2, req3]
-    │   ~~~~~~    │  Water level = queue size
-    │      ↓      │  Leaks at constant rate
-    └─────────────┘
-          ↓
-    Processed (steady rate)
-```
-
-**How it works:**
-1. Requests enter the bucket (queue)
-2. Requests are processed at a constant leak rate
-3. If bucket is full, new requests are rejected
-4. If bucket has space, requests are queued
-
-### Advantages
-
-| Advantage | Explanation |
-|-----------|-------------|
-| **Constant output** | Enforces strict, predictable rate |
-| **Smooths bursts** | Converts bursty input to steady output |
-| **Protects downstream** | Prevents system overload |
-| **FIFO order** | Requests processed in order |
-
-### Disadvantages
-
-| Disadvantage | Explanation |
-|--------------|-------------|
-| **No burst** | Cannot handle sudden spikes |
-| **Latency** | Requests may wait in queue |
-| **Queue management** | Requires maintaining request queue |
-| **Strict rejection** | May reject during temporary spikes |
-
-### Real-World Use Cases
-
-- **Database Connections**: Connection pool rate limiting
-- **Message Queues**: Kafka, RabbitMQ throughput control
-- **Video Streaming**: Constant bitrate enforcement
-- **Print Spooling**: Managing print job flow
-- **Payment Processing**: Steady transaction processing
+### 3.1 Step-by-Step Data Flow
+1. **Trigger:** A client service (e.g., Billing Service, Order Service) sends a request to the Notification API Gateway.
+2. **Validation & Metadata Retrieval:** The Notification Service validates the request, fetches the user's contact info (device tokens, email, phone) from the Database, and checks user preferences (has the user muted this category?).
+3. **Queueing:** The service constructs the final message payload and pushes it into an appropriate Message Queue (e.g., Kafka or RabbitMQ) based on the channel and priority.
+4. **Processing:** Dedicated workers (Push Worker, SMS Worker, Email Worker) pull messages from the queues.
+5. **Dispatch:** The workers call the respective third-party APIs (APNs for iOS, FCM for Android, Twilio for SMS, SendGrid for Email).
+6. **Tracking & Retry:** Success/Failure responses are logged. Failures due to transient errors are sent to a Retry Queue. Persistent failures go to a Dead Letter Queue (DLQ).
 
 ---
 
-## 3. Fixed Window Counter
+## 4. Core Components Deep Dive
 
-### Concept
+### 4.1 API Gateway & Notification Servers
+* **Stateless Design:** Notification servers should be completely stateless, allowing them to scale horizontally behind a load balancer.
+* **Authentication & Rate Limiting:** The API gateway ensures that only authorized internal microservices can trigger notifications and applies tenant-level rate limiting.
 
-The Fixed Window Counter divides time into fixed windows and counts requests per window:
+### 4.2 Caching Layer (Redis / Memcached)
+* **Device Tokens & Profiles:** Fetching user data from the DB for every notification is slow. Frequently accessed data (like device tokens and user preferences) is cached in Redis.
+* **Deduplication:** A distributed cache is used to ensure the same notification is not sent multiple times within a short window. The system caches a hash of the `(user_id + message_id)` with a short TTL.
 
-- **Window size**: Duration of each time window
-- **Max requests**: Limit per window
-- **Request handling**: Count requests, reset at window boundary
+### 4.3 Database Storage
+* **Relational Database (PostgreSQL / MySQL):** Used to store user profiles, device tokens, notification templates, and user preferences. These require ACID properties and complex joins.
+* **NoSQL / Time-Series Database (Cassandra / MongoDB):** Used to store notification logs, delivery statuses, and analytics data. This data grows exponentially and requires high write throughput.
 
-```
-Time:   |----1s----|----1s----|----1s----|
-Window: [ Window 1 ][ Window 2 ][ Window 3 ]
-Count:  [    5     ][    3     ][    0     ]
-Limit:  [   10     ][   10     ][   10     ]
-Status: [   OK     ][   OK     ][   OK     ]
-```
+### 4.4 Message Queues (Apache Kafka / RabbitMQ)
+Queues act as shock absorbers during traffic spikes, decoupling the message generation from the actual dispatch.
+* **Channel Segregation:** Separate topics/queues for iOS, Android, SMS, and Email.
+* **Priority Segregation:** Separate queues for High Priority (OTPs, Security Alerts) and Low Priority (Marketing).
 
-**How it works:**
-1. Track current window start time and request count
-2. When a request arrives:
-   - If new window: reset counter, update window start
-   - If count < max: increment counter, allow request
-   - If count >= max: reject request
-
-### Advantages
-
-| Advantage | Explanation |
-|-----------|-------------|
-| **Simple** | Easiest to implement |
-| **Memory efficient** | Only stores counter + timestamp |
-| **Fast** | O(1) operations |
-| **Predictable** | Clear window boundaries |
-
-### Disadvantages
-
-| Disadvantage | Explanation |
-|--------------|-------------|
-| **Boundary problem** | Can allow 2x burst at window edges |
-| **Sudden resets** | Counter resets cause rate spikes |
-| **Not smooth** | Jerky rate limiting at boundaries |
-
-**Boundary Problem Example:**
-```
-Window 1 ends at t=1.0s, Window 2 starts at t=1.0s
-
-t=0.9s: 10 requests (Window 1, at limit)
-t=1.0s: Window resets
-t=1.0s: 10 more requests (Window 2, fresh limit)
-
-Result: 20 requests in 0.1 seconds!
-```
-
-### Real-World Use Cases
-
-- **Simple API Limits**: Basic rate limiting for small APIs
-- **Analytics**: Counting events per time period
-- **Metrics Collection**: Prometheus-style counters
-- **When precision isn't critical**: Internal services
+### 4.5 Dispatch Workers
+Microservices written in high-concurrency languages (like Go, Java, or Rust). They consume messages, apply third-party API keys, and manage HTTP connections to external providers.
 
 ---
 
-## 4. Sliding Window Log
+## 5. Advanced System Design Concepts
 
-### Concept
+### 5.1 Retry Mechanism and Dead-Letter Queues (DLQ)
+Third-party services (APNs, Twilio) can experience downtime or rate-limit your requests.
+* **Exponential Backoff:** If a message fails, the worker puts it into a delayed retry queue. The delay increases exponentially (e.g., 2s, 4s, 8s, 16s) to prevent hammering the failing third-party API.
+* **DLQ:** If a message fails after maximum retries (e.g., 5 times), it is moved to a DLQ for manual inspection or alerting.
 
-The Sliding Window Log maintains a log of timestamps for all requests in the window:
+### 5.2 Rate Limiting and Throttling
+* **Provider Limits:** Third-party APIs strictly rate-limit incoming requests. Workers must implement client-side throttling (e.g., using Token Bucket or Leaky Bucket algorithms) to avoid being temporarily banned.
+* **User Fatigue:** A "Notification Frequency Cap" service checks how many promotional messages a user has received in the last 24 hours. If the limit is exceeded, the message is dropped.
 
-- **Window size**: Duration of sliding window
-- **Max requests**: Limit within any sliding window
-- **Request handling**: Store timestamps, remove old ones
+### 5.3 At-Least-Once vs. Exactly-Once Delivery
+Due to the nature of distributed systems and network partitions, achieving "exactly-once" delivery is incredibly difficult and expensive.
+* The system is designed for **At-Least-Once delivery**.
+* To mitigate duplicates, the deduplication cache (mentioned in 4.2) and idempotency keys are utilized.
 
-```
-Time: ----|----|----|----|----|---->
-          t-3  t-2  t-1   t   t+1
-
-Log at time t: [t-2.5, t-1.8, t-0.5]
-                 ↑_______________↑
-                 Window: [t-3, t]
-
-As time slides, old entries fall out
-```
-
-**How it works:**
-1. Maintain a log (deque) of request timestamps
-2. When a request arrives:
-   - Remove timestamps older than (now - window_size)
-   - If log size < max: add timestamp, allow request
-   - If log size >= max: reject request
-
-### Advantages
-
-| Advantage | Explanation |
-|-----------|-------------|
-| **Precise** | Exact rate limiting, no boundary issues |
-| **Smooth** | No sudden spikes or resets |
-| **Accurate** | True sliding window behavior |
-| **Fair** | Consistent limiting at all times |
-
-### Disadvantages
-
-| Disadvantage | Explanation |
-|--------------|-------------|
-| **Memory intensive** | Stores timestamp per request |
-| **Slower cleanup** | O(n) to remove old entries |
-| **Not scalable** | Poor for high-throughput systems |
-| **Storage overhead** | Can grow large with many requests |
-
-### Real-World Use Cases
-
-- **Login Rate Limiting**: Security-critical applications
-- **Low-volume APIs**: Precise limiting for expensive operations
-- **Audit Systems**: When request history is needed anyway
-- **Anti-abuse**: CAPTCHA triggering, fraud detection
+### 5.4 Bulk Notifications & Batching
+For sending a breaking news alert to 10 million users:
+* A `BatchProcessor` service splits the massive user list into smaller chunks (e.g., 10,000 users per chunk).
+* These chunks are distributed across multiple partitions in Kafka.
+* Hundreds of workers process the partitions in parallel, reducing the total delivery time from hours to seconds.
 
 ---
 
-## 5. Sliding Window Counter
+## 6. Analytics, Tracking, and Observability
 
-### Concept
-
-The Sliding Window Counter is a hybrid approach using weighted counters:
-
-- **Window size**: Duration of each fixed window
-- **Max requests**: Limit per sliding window
-- **Request handling**: Weighted average of current + previous window
-
-```
-Time:     |----1s----|----1s----|
-Window:   [ Previous ][ Current ]
-Count:    [    8     ][    4     ]
-
-At t = 0.5s into current window:
-- 50% of previous window still in sliding window
-- Weighted count = (8 × 0.5) + 4 = 8 requests
-
-Sliding window: [----prev 50%----|----curr 50%----]
-```
-
-**How it works:**
-1. Track counters for current and previous windows
-2. When a request arrives:
-   - Update windows if needed (shift current→previous)
-   - Calculate weighted count: `(prev × weight) + current`
-   - Weight = portion of previous window in sliding window
-   - If weighted < max: increment current, allow request
-   - Otherwise: reject request
-
-### Advantages
-
-| Advantage | Explanation |
-|-----------|-------------|
-| **No boundary problem** | Smooths across window edges |
-| **Memory efficient** | Only 2 counters needed |
-| **Good approximation** | Close to true sliding window |
-| **Fast** | O(1) operations |
-| **Scalable** | Works well in distributed systems |
-
-### Disadvantages
-
-| Disadvantage | Explanation |
-|--------------|-------------|
-| **Approximation** | Not exact (slight over/under counting) |
-| **More complex** | Harder to understand than Fixed Window |
-| **Some boundary effects** | Reduced but not eliminated |
-
-### Real-World Use Cases
-
-- **High-throughput APIs**: Google, Netflix rate limiting
-- **Distributed Systems**: Easy to aggregate across nodes
-- **Redis-based Limiting**: INCR with expiration
-- **Cloud Load Balancers**: AWS ALB, CloudFlare
-- **Microservices**: Service mesh rate limiting
+To ensure the system is healthy and to provide business metrics:
+* **Delivery Status Callbacks:** Webhooks from SendGrid or Twilio are processed by a Feedback Service to update the status in the NoSQL database (e.g., Delivered, Bounced, Clicked).
+* **Metrics & Monitoring:** Use Prometheus & Grafana to monitor Queue Depth (lag), Message Processing Rate, and Error Rates.
+* **Alerting:** PagerDuty integration triggers alerts if queue lag exceeds a specific threshold or if third-party API failure rates spike.
 
 ---
 
-## 6. Comparison Summary
-
-### Algorithm Comparison Table
-
-| Algorithm | Memory | Speed | Burst | Precision | Best For |
-|-----------|--------|-------|-------|-----------|----------|
-| Token Bucket | O(1) | O(1) | ✅ Yes | Medium | APIs with burst allowance |
-| Leaky Bucket | O(n)* | O(1) | ❌ No | High | Steady throughput systems |
-| Fixed Window | O(1) | O(1) | ⚠️ Edge | Low | Simple implementations |
-| Sliding Log | O(n) | O(n) | ❌ No | ✅ Exact | Security, low-volume |
-| Sliding Counter | O(1) | O(1) | ❌ No | High | High-throughput APIs |
-
-*Leaky Bucket queue size depends on capacity
-
-### When to Use Each Algorithm
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Need burst allowance?                                      │
-│  ├── Yes → Token Bucket                                     │
-│  └── No → Continue...                                       │
-│                                                             │
-│  Need steady output rate?                                   │
-│  ├── Yes → Leaky Bucket                                     │
-│  └── No → Continue...                                       │
-│                                                             │
-│  High throughput system?                                    │
-│  ├── Yes → Sliding Window Counter                           │
-│  └── No → Continue...                                       │
-│                                                             │
-│  Need exact precision?                                      │
-│  ├── Yes → Sliding Window Log                               │
-│  └── No → Fixed Window Counter (simplest)                   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Key Takeaways
-
-1. **Token Bucket**: Best for user-facing APIs where occasional bursts are acceptable
-2. **Leaky Bucket**: Best for protecting downstream systems with steady processing
-3. **Fixed Window**: Good for simple use cases where precision isn't critical
-4. **Sliding Log**: Best for security-critical applications requiring exact limits
-5. **Sliding Counter**: Best for high-scale distributed systems
-
----
-
-## Running the Demo
-
-```bash
-# From the project root directory
-python -m rate_limiter.demo.main
-```
-
-Or directly:
-
-```bash
-python rate_limiter/demo/main.py
-```
-
----
-
-## Further Reading
-
-- **Rate Limiting at Scale**: Netflix Tech Blog
-- **API Rate Limiting**: Stripe Engineering
-- **Distributed Rate Limiting**: Redis + Lua scripts
-- **Envoy Proxy**: Rate limiting filters
-- **Kong Gateway**: Rate limiting plugins
+## 7. Conclusion
+Building a scalable notification system requires careful decoupling of components using message queues, robust retry mechanisms, and a dual-database approach for handling configurations vs. massive telemetry data. By implementing priority queues, strict rate limiting, and extensive monitoring, the system can reliably handle billions of messages across a diverse global user base.
